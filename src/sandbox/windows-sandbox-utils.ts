@@ -1581,19 +1581,28 @@ export function interpretWindowsWfpVerify(
   // With loopback open `srt-win` picks where the blocked attempts go.
   // Aimed at the other address family, they checked a block filter
   // other than the one this run is for: an `srt-win` without
-  // `wfp-verify-per-family`, whatever it reports.
+  // `wfp-verify-per-family`, whatever it reports. `initialize()` has
+  // checked the reported capabilities and made the session's grants
+  // before this runs, so the message claims neither.
   const isV6 = (a: string): boolean => a.startsWith('[')
   if (
     raw.allow_loopback &&
     raw.egress_target !== undefined &&
     isV6(raw.egress_target) !== isV6(raw.target)
   ) {
-    throw windowsSrtWinOutdatedError(
-      WINDOWS_SRT_WIN_CAPABILITIES.wfpVerifyPerFamily,
-      `the session-start fence check needs to verify the block filter ` +
-        `of each address family (this run, for the loopback listener ` +
-        `${raw.target}, aimed the attempts that must be blocked at ` +
-        `${raw.egress_target})`,
+    throw new WindowsSandboxError(
+      'srt_win_outdated',
+      `The srt-win in use does not check the network fence per address ` +
+        `family (the capability ` +
+        `'${WINDOWS_SRT_WIN_CAPABILITIES.wfpVerifyPerFamily}'), whether ` +
+        `or not it reports it: the run for the loopback listener ` +
+        `${raw.target} aimed the attempts that must be blocked at ` +
+        `${raw.egress_target}, so the block filter for ` +
+        `${isV6(raw.target) ? 'IPv6' : 'IPv4'} was not checked. Update ` +
+        `srt-win (the one shipped with the program embedding this ` +
+        `library, or the package's own) to a build that matches the ` +
+        `library. A session start that meets this releases the grants ` +
+        `it made for the session.`,
     )
   }
   // The attempts the fence must refuse. One getting through rejects
@@ -1761,8 +1770,9 @@ type WfpVerifyOptions = {
  * @param opts.anonymousEgress also make the off-loopback attempt under
  *   the anonymous token. It cannot change the result and can take
  *   seconds, so `initialize()` leaves it out; for diagnostics only.
- *   Made in the first run only: its destination does not depend on
- *   the listener's family.
+ *   Made in the first run only: its destination is this machine's
+ *   off-loopback address at the listener's port, in the same address
+ *   family whichever listener's port it takes.
  * @param opts.writeRoots the session's write roots: the probe runs
  *   under the write-restricted token a command of the session gets.
  * @throws `wfp_verify_bind_failed` when a family's listener cannot be
@@ -1788,8 +1798,10 @@ export async function verifyWindowsWfpEgress(
       }
     }
     // One family at a time: the first that fails rejects. The
-    // off-loopback attempts go to the same address in both runs, so the
-    // slow anonymous one is made in the first only.
+    // off-loopback attempts go to the same off-loopback address in both
+    // runs, at a different port (each run's listener's), so they meet
+    // the same filter, and the slow anonymous one is made in the first
+    // only.
     const results: WindowsWfpVerifyResult[] = []
     for (const target of targets) {
       results.push(

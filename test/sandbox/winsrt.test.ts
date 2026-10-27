@@ -3497,7 +3497,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       `'${WINDOWS_SRT_WIN_CAPABILITIES.wfpVerifyPerFamily}'`,
     )
     expect((err as WindowsSandboxError).message).toMatch(
-      /listener \[::1\]:49998, aimed the attempts that must be blocked at 127\.0\.0\.1:1/,
+      /listener \[::1\]:49998 aimed the attempts that must be blocked at 127\.0\.0\.1:1, so the block filter for IPv6 was not checked/,
     )
   })
 
@@ -8014,6 +8014,67 @@ describe('Windows profile read grant (pure, all platforms)', () => {
           expect(stdinOf('acl grant')?.denyRead).toEqual([home])
         })
       }
+
+      it('an srt-win that reports the per-family check but aims the IPv6 run at 127.0.0.1: srt_win_outdated, saying so, after the grants it made are released', async () => {
+        // The capabilities pass; the fence check runs after the grant.
+        // In place of the harness's verifyWindowsWfpEgress spy, one that
+        // hands the run such an srt-win prints to the real interpretation.
+        spies[1].mockRestore()
+        spies[1] = spyOn(winUtils, 'verifyWindowsWfpEgress').mockImplementation(
+          (async () =>
+            winUtils.interpretWindowsWfpVerify({
+              status: 0,
+              stdout: JSON.stringify({
+                egress_probe: 'blocked',
+                low_integrity_probe: 'blocked',
+                low_integrity_loopback_probe: 'blocked',
+                untrusted_integrity_probe: 'blocked',
+                untrusted_integrity_loopback_probe: 'blocked',
+                anonymous_loopback_probe: 'skipped',
+                deny_only_probe: 'skipped',
+                open_loopback_probe: 'connected',
+                target: '[::1]:49998',
+                egress_target: `127.0.0.1:${WINDOWS_LOOPBACK_PROBE_PORT}`,
+                anonymous_target: '10.0.0.5:49998',
+                allow_loopback: true,
+                residuals: [],
+              }),
+              stderr: '',
+            })) as never,
+        )
+        // The fence check is made once per sandbox account and loopback
+        // mode in a process: under another account's SID it is made again.
+        const userStatus = winUtils.getWindowsSandboxUserStatusAsync
+        spies.push(
+          spyOn(
+            winUtils,
+            'getWindowsSandboxUserStatusAsync',
+          ).mockImplementation((async (
+            o: Parameters<typeof userStatus>[0],
+          ) => ({
+            ...(await userStatus(o)),
+            sid: 'S-1-5-21-1-per-family',
+          })) as never),
+        )
+        const e = await rejection(config())
+        expect(e).toBeInstanceOf(WindowsSandboxError)
+        expect(e.code).toBe('srt_win_outdated')
+        expect(e.message).toContain(
+          `'${WINDOWS_SRT_WIN_CAPABILITIES.wfpVerifyPerFamily}'), whether or not it reports it`,
+        )
+        expect(e.message).toContain(
+          'releases the grants it made for the session',
+        )
+        expect(e.message).not.toContain('does not report the capability')
+        expect(e.message).not.toContain('Nothing was granted')
+        // Granted first, then released by initialize()'s catch.
+        expect(names().filter(n => n.startsWith('acl '))).toEqual([
+          'acl grant',
+          'acl revoke',
+          'acl restore',
+        ])
+        expect(SandboxManager.getConfig()).toBeUndefined()
+      })
 
       it('a per-command read deny is checked against the srt-win it will run through, each one, and a no is asked again', async () => {
         const other = join(work, 'other-srt-win.exe')
