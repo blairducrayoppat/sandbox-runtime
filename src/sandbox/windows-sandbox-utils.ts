@@ -1799,9 +1799,8 @@ export async function verifyWindowsWfpEgress(
     }
     // One family at a time: the first that fails rejects. The
     // off-loopback attempts go to the same off-loopback address in both
-    // runs, at a different port (each run's listener's), so they meet
-    // the same filter, and the slow anonymous one is made in the first
-    // only.
+    // runs, each at its own run's listener port, so they meet the same
+    // filter, and the slow anonymous one is made in the first only.
     const results: WindowsWfpVerifyResult[] = []
     for (const target of targets) {
       results.push(
