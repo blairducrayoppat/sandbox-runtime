@@ -784,7 +784,8 @@ fn attempt(name: &str, id: Identity, target: &SocketAddr) -> Result<Outcome> {
 /// which can wait on its destination, runs only with `anonymous_egress`.
 ///
 /// With `allow_loopback` the attempts the filters must refuse on
-/// loopback go to [`crate::wfp::LOOPBACK_PROBE_PORT`], where nothing
+/// loopback go to [`crate::wfp::LOOPBACK_PROBE_PORT`] in `target`'s
+/// address family ([`blocked_loopback_target`]), where nothing
 /// listens, and `open_loopback` connects to `target`. The two
 /// residual-only loopback attempts would each wait out a closed port
 /// there, so they skip.
@@ -814,7 +815,7 @@ pub fn run(
         None => skipped(name, "no off-loopback target"),
     };
     let blocked_target = if allow_loopback {
-        blocked_loopback_target()
+        blocked_loopback_target(&target)
     } else {
         target
     };
@@ -853,12 +854,15 @@ pub fn run(
     })
 }
 
-/// Where the attempts the filters must refuse go with loopback open.
-pub fn blocked_loopback_target() -> SocketAddr {
-    SocketAddr::from((
-        std::net::Ipv4Addr::LOCALHOST,
-        crate::wfp::LOOPBACK_PROBE_PORT,
-    ))
+/// Where the attempts the filters must refuse go with loopback open:
+/// the reserved port on the loopback address of `target`'s family.
+/// Each family has its own block filter, so each is probed in its own.
+pub fn blocked_loopback_target(target: &SocketAddr) -> SocketAddr {
+    let ip: std::net::IpAddr = match target {
+        SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+        SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+    };
+    SocketAddr::new(ip, crate::wfp::LOOPBACK_PROBE_PORT)
 }
 
 /// Direct TCP connect to `target` (`ip:port`), classified as an exit
@@ -1062,10 +1066,17 @@ mod tests {
     }
 
     #[test]
-    fn the_blocked_loopback_target_is_the_reserved_port() {
-        let t = blocked_loopback_target();
-        assert!(t.ip().is_loopback());
-        assert_eq!(t.port(), crate::wfp::LOOPBACK_PROBE_PORT);
+    fn the_blocked_loopback_target_is_the_reserved_port_in_the_targets_family() {
+        for (target, want) in [
+            ("127.0.0.1:50123", "127.0.0.1:1"),
+            ("127.0.0.2:50123", "127.0.0.1:1"),
+            ("[::1]:50123", "[::1]:1"),
+        ] {
+            let t = blocked_loopback_target(&target.parse().unwrap());
+            assert_eq!(t, want.parse::<SocketAddr>().unwrap(), "{target}");
+            assert!(t.ip().is_loopback());
+            assert_eq!(t.port(), crate::wfp::LOOPBACK_PROBE_PORT);
+        }
     }
 
     /// `r` with the lowered-integrity attempts replaced, in field order.

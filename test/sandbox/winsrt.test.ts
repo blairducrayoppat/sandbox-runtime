@@ -3222,26 +3222,35 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
   })
 
   /**
-   * Stand-in for net.createServer. `taken` ports fail to listen; a
-   * listen on port 0 is handed the next of `ephemeral`.
+   * Stand-in for net.createServer. `taken` ports and `unbindable`
+   * hosts fail to listen; a listen on port 0 is handed the next of
+   * `ephemeral`.
    */
-  const fakeServers = (taken: number[], ephemeral: number[] = []) => {
+  const fakeServers = (
+    taken: number[],
+    ephemeral: number[] = [],
+    unbindable: string[] = [],
+  ) => {
     const asked: number[] = []
+    const hosts: string[] = []
     const closed: number[] = []
     const spy = spyOn(net, 'createServer').mockImplementation((() => {
       let port = -1
       const s = new EventEmitter() as EventEmitter & {
-        listen(p: number): void
+        listen(p: number, host: string): void
         address(): { port: number }
         close(): void
       }
-      s.listen = (p: number) => {
+      s.listen = (p: number, host: string) => {
         asked.push(p)
-        port = p === 0 ? ephemeral.shift()! : p
+        hosts.push(host)
+        port = p === 0 && !unbindable.includes(host) ? ephemeral.shift()! : p
         setImmediate(() =>
-          taken.includes(port)
-            ? s.emit('error', new Error('EADDRINUSE'))
-            : s.emit('listening'),
+          unbindable.includes(host)
+            ? s.emit('error', new Error('EADDRNOTAVAIL'))
+            : taken.includes(port)
+              ? s.emit('error', new Error('EADDRINUSE'))
+              : s.emit('listening'),
         )
       }
       s.address = () => ({ port })
@@ -3249,13 +3258,25 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       return s
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     }) as any)
-    return { asked, closed, spy }
+    return { asked, hosts, closed, spy }
   }
+  const targetOf = (argv: readonly string[]): string =>
+    argv[argv.indexOf('--target') + 1]
+  const targetsRun = (): string[] =>
+    spawnSpy.mock.calls.map((c: unknown[]) => targetOf(c[1] as string[]))
 
-  it('verifyWindowsWfpEgress: with loopback open the listener is likewise an ephemeral port outside the proxy range', async () => {
-    const servers = fakeServers([], [60085, 49999])
+  it('verifyWindowsWfpEgress: with loopback open the listeners are likewise ephemeral ports outside the proxy range', async () => {
+    const servers = fakeServers([], [60085, 49999, 60086, 49998])
     try {
-      stubSpawn(() => ({ status: 0, stdout: openOut() }))
+      stubSpawn(argv => ({
+        status: 0,
+        stdout: openOut({
+          target: targetOf(argv),
+          egress_target: targetOf(argv).startsWith('[')
+            ? `[::1]:${WINDOWS_LOOPBACK_PROBE_PORT}`
+            : `127.0.0.1:${WINDOWS_LOOPBACK_PROBE_PORT}`,
+        }),
+      }))
       await verifyWindowsWfpEgress({
         allowLoopback: true,
         srtWin: resolveSrtWin({ path: process.execPath }),
@@ -3263,28 +3284,178 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       const argv = spawnSpy.mock.calls[0][1] as string[]
       // The proxy range is reachable with loopback closed too, so a
       // listener there would not show that loopback is open.
-      expect(argv[argv.indexOf('--target') + 1]).toBe('127.0.0.1:49999')
+      expect(targetsRun()).toEqual(['127.0.0.1:49999', '[::1]:49998'])
       expect(argv).not.toContain('--proxy-port-range')
-      expect(servers.closed).toEqual([60085, 49999])
+      expect(servers.closed).toEqual([60085, 60086, 49999, 49998])
     } finally {
       servers.spy.mockRestore()
     }
   })
 
-  it('verifyWindowsWfpEgress: with loopback closed the listener is an ephemeral port outside the proxy range', async () => {
-    const servers = fakeServers([], [60085, 49999])
+  it('verifyWindowsWfpEgress: with loopback closed the listeners are ephemeral ports outside the proxy range', async () => {
+    const servers = fakeServers([], [60085, 49999, 60086, 49998])
     try {
-      stubSpawn(() => ({ status: 0, stdout: verifyOut() }))
+      stubSpawn(argv => ({
+        status: 0,
+        stdout: verifyOut({ target: targetOf(argv) }),
+      }))
       await verifyWindowsWfpEgress({
         srtWin: resolveSrtWin({ path: process.execPath }),
       })
-      const argv = spawnSpy.mock.calls[0][1] as string[]
-      expect(argv[argv.indexOf('--target') + 1]).toBe('127.0.0.1:49999')
-      expect(servers.asked).toEqual([0, 0])
-      expect(servers.closed).toEqual([60085, 49999])
+      expect(targetsRun()).toEqual(['127.0.0.1:49999', '[::1]:49998'])
+      expect(servers.asked).toEqual([0, 0, 0, 0])
+      expect(servers.hosts).toEqual(['127.0.0.1', '127.0.0.1', '::1', '::1'])
+      expect(servers.closed).toEqual([60085, 60086, 49999, 49998])
     } finally {
       servers.spy.mockRestore()
     }
+  })
+
+  it('verifyWindowsWfpEgress: each loopback family gets its own run; both blocked resolves with both targets and the residuals of both', async () => {
+    const servers = fakeServers([], [49999, 49998])
+    try {
+      stubSpawn(argv =>
+        targetOf(argv).startsWith('[')
+          ? {
+              status: 0,
+              stdout: verifyOut({
+                target: targetOf(argv),
+                deny_only_probe: 'connected',
+                residuals: ['deny-only-user-sid'],
+              }),
+            }
+          : { status: 0, stdout: verifyOut({ target: targetOf(argv) }) },
+      )
+      const r = await verifyWindowsWfpEgress({
+        srtWin: resolveSrtWin({ path: process.execPath }),
+      })
+      expect(targetsRun()).toEqual(['127.0.0.1:49999', '[::1]:49998'])
+      expect(r.target).toBe('127.0.0.1:49999')
+      expect(r.probes.plain).toBe('blocked')
+      expect(r.ipv6?.target).toBe('[::1]:49998')
+      expect(r.ipv6?.probes.plain).toBe('blocked')
+      expect(r.ipv6?.residuals).toEqual(['deny-only-user-sid'])
+      expect(r.residuals).toEqual(['deny-only-user-sid'])
+      expect(r.warnings.length).toBe(1)
+      expect(servers.closed).toEqual([49999, 49998])
+    } finally {
+      servers.spy.mockRestore()
+    }
+  })
+
+  it('verifyWindowsWfpEgress: the IPv6 loopback not blocked rejects (wfp_fence_inactive) though IPv4 is', async () => {
+    for (const allowLoopback of [false, true]) {
+      const servers = fakeServers([], [49999, 49998])
+      try {
+        stubSpawn(argv => {
+          const target = targetOf(argv)
+          const v6 = target.startsWith('[')
+          const out = allowLoopback ? openOut : verifyOut
+          return {
+            status: v6 ? 3 : 0,
+            stdout: out({
+              target,
+              ...(allowLoopback && {
+                egress_target: v6
+                  ? `[::1]:${WINDOWS_LOOPBACK_PROBE_PORT}`
+                  : `127.0.0.1:${WINDOWS_LOOPBACK_PROBE_PORT}`,
+              }),
+              egress_probe: v6 ? 'connected' : 'blocked',
+            }),
+          }
+        })
+        const err = await verifyWindowsWfpEgress({
+          allowLoopback,
+          srtWin: resolveSrtWin({ path: process.execPath }),
+        }).catch(e => e as WindowsSandboxError)
+        expect(err).toBeInstanceOf(WindowsSandboxError)
+        expect((err as WindowsSandboxError).code).toBe('wfp_fence_inactive')
+        expect((err as WindowsSandboxError).message).toMatch(
+          allowLoopback
+            ? new RegExp(`to \\[::1\\]:${WINDOWS_LOOPBACK_PROBE_PORT}\\b`)
+            : /to \[::1\]:49998/,
+        )
+        expect(targetsRun()).toEqual(['127.0.0.1:49999', '[::1]:49998'])
+        expect(servers.closed).toEqual([49999, 49998])
+      } finally {
+        servers.spy.mockRestore()
+        spawnSpy.mockRestore()
+        spawnSyncSpy.mockRestore()
+      }
+    }
+  })
+
+  it('verifyWindowsWfpEgress: an unbindable [::1] rejects (wfp_verify_bind_failed) before any run, and the IPv4 listener is closed', async () => {
+    const servers = fakeServers([], [49999], ['::1'])
+    try {
+      stubSpawn(() => ({ status: 0, stdout: verifyOut() }))
+      const err = await verifyWindowsWfpEgress({
+        srtWin: resolveSrtWin({ path: process.execPath }),
+      }).catch(e => e as WindowsSandboxError)
+      expect((err as WindowsSandboxError).code).toBe('wfp_verify_bind_failed')
+      expect((err as WindowsSandboxError).message).toMatch(/on ::1/)
+      expect(spawnSpy.mock.calls.length).toBe(0)
+      expect(servers.closed).toContain(49999)
+    } finally {
+      servers.spy.mockRestore()
+    }
+  })
+
+  it('verifyWindowsWfpEgress: opts.target binds nothing and makes one run, against that target', async () => {
+    const servers = fakeServers([], [49999, 49998])
+    try {
+      stubSpawn(() => ({ status: 0, stdout: verifyOut() }))
+      const r = await verifyWindowsWfpEgress({
+        target: '127.0.0.1:49999',
+        srtWin: resolveSrtWin({ path: process.execPath }),
+      })
+      expect(servers.asked).toEqual([])
+      expect(targetsRun()).toEqual(['127.0.0.1:49999'])
+      expect(r.ipv6).toBeUndefined()
+    } finally {
+      servers.spy.mockRestore()
+    }
+  })
+
+  it('verifyWindowsWfpEgress: with loopback open the IPv6 run must be aimed at [::1] on the reserved port; an srt-win that aims it at 127.0.0.1 rejects as too old', async () => {
+    const reservedV6 = `[::1]:${WINDOWS_LOOPBACK_PROBE_PORT}`
+    const run = async (v6EgressTarget: string) => {
+      const servers = fakeServers([], [49999, 49998])
+      try {
+        stubSpawn(argv => ({
+          status: 0,
+          stdout: openOut({
+            target: targetOf(argv),
+            egress_target: targetOf(argv).startsWith('[')
+              ? v6EgressTarget
+              : `127.0.0.1:${WINDOWS_LOOPBACK_PROBE_PORT}`,
+          }),
+        }))
+        return await verifyWindowsWfpEgress({
+          allowLoopback: true,
+          srtWin: resolveSrtWin({ path: process.execPath }),
+        })
+      } finally {
+        servers.spy.mockRestore()
+      }
+    }
+    const r = await run(reservedV6)
+    for (const c of spawnSpy.mock.calls) {
+      expect(c[1] as string[]).toContain('--allow-loopback')
+    }
+    expect(r.ipv6?.target).toBe('[::1]:49998')
+    expect(r.ipv6?.probes.openLoopback).toBe('connected')
+    // One notice for both runs.
+    expect(r.warnings).toEqual([WINDOWS_ALLOW_LOOPBACK_EFFECT])
+    spawnSpy.mockRestore()
+    spawnSyncSpy.mockRestore()
+    const err = await run(`127.0.0.1:${WINDOWS_LOOPBACK_PROBE_PORT}`).catch(
+      e => e as WindowsSandboxError,
+    )
+    expect((err as WindowsSandboxError).code).toBe('srt_win_too_old')
+    expect((err as WindowsSandboxError).message).toMatch(
+      /listener \[::1\]:49998 at 127\.0\.0\.1:1/,
+    )
   })
 
   it('checkWindowsDependencies: the suggested install carries the configured loopback mode and install options', () => {

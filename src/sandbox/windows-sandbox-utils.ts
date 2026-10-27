@@ -96,7 +96,11 @@ export type WindowsSandboxErrorCode =
    * with `network.allowLocalBinding` (`srt-win` exit 19).
    */
   | 'wfp_loopback_mismatch'
-  /** `srt-win` predates `--allow-loopback`; `network.allowLocalBinding` needs a newer one. */
+  /**
+   * `srt-win` predates `--allow-loopback`, or aims the loopback-open
+   * fence check at another address family than the listener's;
+   * `network.allowLocalBinding` needs a newer one.
+   */
   | 'srt_win_too_old'
   /** `srt-win user trust-ca` exited non-zero. */
   | 'trust_ca_failed'
@@ -315,6 +319,16 @@ export interface WindowsWfpVerifyResult {
    * `initialize()` logs them.
    */
   warnings: string[]
+  /**
+   * The run against the IPv6 loopback listener, when
+   * {@link verifyWindowsWfpEgress} bound the listeners itself (no
+   * `target`). `target`, `stderr` and `probes` above are then the IPv4
+   * run's; `residuals` and `warnings` above cover both runs.
+   */
+  ipv6?: Pick<
+    WindowsWfpVerifyResult,
+    'target' | 'stderr' | 'probes' | 'residuals'
+  >
 }
 
 /**
@@ -1555,6 +1569,23 @@ export function interpretWindowsWfpVerify(
         `\`.`,
     )
   }
+  // With loopback open `srt-win` picks where the blocked attempts go.
+  // Aimed at the other address family, they checked a block filter
+  // other than the one this run is for.
+  const isV6 = (a: string): boolean => a.startsWith('[')
+  if (
+    raw.allow_loopback &&
+    raw.egress_target !== undefined &&
+    isV6(raw.egress_target) !== isV6(raw.target)
+  ) {
+    throw new WindowsSandboxError(
+      'srt_win_too_old',
+      `srt-win aimed the attempts that must be blocked for the loopback ` +
+        `listener ${raw.target} at ${raw.egress_target}, in the other ` +
+        `address family, so the block filter for ${raw.target}'s family ` +
+        `was not checked. Update srt-win. [${summary}]`,
+    )
+  }
   // The attempts the fence must refuse. One getting through rejects
   // whatever the exit code says.
   const lowIl = 'the sandbox user under a low-integrity copy of its token'
@@ -1628,12 +1659,70 @@ export function interpretWindowsWfpVerify(
 }
 
 /**
+ * Bind a loopback listener on `host` at an ephemeral port outside the
+ * WFP loopback-permit range `[lo, hi]` (a port in-range would be
+ * PERMITted even with the fence active → false `connected`).
+ *
+ * @throws `wfp_verify_bind_failed` when `host` cannot be bound, or
+ *   every attempt lands in-range.
+ */
+async function bindWfpProbeListener(
+  host: '127.0.0.1' | '::1',
+  [lo, hi]: readonly [number, number],
+): Promise<{ server: net.Server; target: string }> {
+  for (let i = 0; i < 5; i++) {
+    // A connect that gets through is accepted while `srt-win` runs:
+    // drop it, and keep its errors from being uncaught.
+    const s = net.createServer(c => c.on('error', () => {}).destroy())
+    try {
+      s.listen(0, host)
+      await once(s, 'listening')
+    } catch (e) {
+      s.close()
+      // A family that cannot be bound cannot be probed; skipping it
+      // would leave that family's block filter unverified.
+      throw new WindowsSandboxError(
+        'wfp_verify_bind_failed',
+        `verifyWindowsWfpEgress: could not bind a loopback listener ` +
+          `on ${host}: ${(e as Error).message}`,
+      )
+    }
+    const p = (s.address() as net.AddressInfo).port
+    if (p < lo || p > hi) {
+      return {
+        server: s,
+        target: host === '::1' ? `[::1]:${p}` : `${host}:${p}`,
+      }
+    }
+    s.close()
+  }
+  throw new WindowsSandboxError(
+    'wfp_verify_bind_failed',
+    `verifyWindowsWfpEgress: could not bind a loopback listener on ` +
+      `${host} outside the WFP permit range [${lo},${hi}] in 5 attempts`,
+  )
+}
+
+type WfpVerifyOptions = {
+  target?: string
+  proxyPortRange?: readonly [number, number]
+  allowLoopback?: boolean
+  anonymousEgress?: boolean
+  sublayerGuid?: string
+  sandboxUser?: string
+  writeRoots?: readonly string[]
+  srtWin?: SrtWinSpawn
+}
+
+/**
  * Behavioral proof that the WFP egress fence is active for the
  * sandbox user. Binds a local listener on an ephemeral loopback port
- * outside the WFP loopback-permit range, then spawns `srt-win
- * runner` as the sandbox user (via `CreateProcessWithLogonW`) to
- * attempt direct TCP connects, one per token shape a sandboxed
- * process can present. The WFP block-user filter
+ * outside the WFP loopback-permit range, on `127.0.0.1` and on `::1`,
+ * then for each spawns `srt-win runner` as the sandbox user (via
+ * `CreateProcessWithLogonW`) to attempt direct TCP connects, one per
+ * token shape a sandboxed process can present. The fence has a block
+ * filter per address family, so each family gets its own run, and a
+ * family that is not blocked fails the check. The WFP block-user filter
  * fires at `ALE_AUTH_CONNECT` — before any packet leaves — so an
  * active fence yields WSAEACCES immediately and a missing fence lets
  * the connect through (the kernel completes the handshake against
@@ -1642,18 +1731,18 @@ export function interpretWindowsWfpVerify(
  * any external host.
  *
  * With `opts.allowLoopback` the connects that must be blocked go to
- * {@link WINDOWS_LOOPBACK_PROBE_PORT}, where nothing listens and only
- * the filter's refusal passes, and the listener is what `srt-win` must
- * be able to reach.
+ * {@link WINDOWS_LOOPBACK_PROBE_PORT} in the listener's address family,
+ * where nothing listens and only the filter's refusal passes, and the
+ * listener is what `srt-win` must be able to reach.
  *
  * `initialize()` calls this once per session, so a stale install
  * (sandbox user provisioned but filters since removed) fails closed
  * at session start instead of running every exec with full egress.
  *
  * @param opts.target overrides the probe target (skips the local
- *   listener bind).
+ *   listener binds): one run, against that target alone.
  * @param opts.proxyPortRange the WFP loopback-permit range the
- *   listener must avoid. Default
+ *   listeners must avoid. Default
  *   {@link DEFAULT_WINDOWS_PROXY_PORT_RANGE}.
  * @param opts.allowLoopback the session's `network.allowLocalBinding`;
  *   `srt-win` compares it with the installed loopback mode.
@@ -1664,84 +1753,81 @@ export function interpretWindowsWfpVerify(
  *   seconds, so `initialize()` leaves it out; for diagnostics only.
  * @param opts.writeRoots the session's write roots: the probe runs
  *   under the write-restricted token a command of the session gets.
- * @throws on any outcome other than exit 0.
+ * @throws `wfp_verify_bind_failed` when a family's listener cannot be
+ *   bound, and on any run's outcome other than exit 0.
  */
 export async function verifyWindowsWfpEgress(
-  opts: {
-    target?: string
-    proxyPortRange?: readonly [number, number]
-    allowLoopback?: boolean
-    anonymousEgress?: boolean
-    sublayerGuid?: string
-    sandboxUser?: string
-    writeRoots?: readonly string[]
-    srtWin?: SrtWinSpawn
-  } = {},
+  opts: WfpVerifyOptions = {},
 ): Promise<WindowsWfpVerifyResult> {
-  let target = opts.target
-  let server: net.Server | undefined
-  if (!target) {
-    // Bind ephemeral; retry if it lands inside the WFP
-    // loopback-permit range (a port in-range would be PERMITted
-    // even with the fence active → false `connected`).
-    const [lo, hi] = opts.proxyPortRange ?? DEFAULT_WINDOWS_PROXY_PORT_RANGE
-    for (let i = 0; i < 5; i++) {
-      // A connect that gets through is accepted while `srt-win` runs:
-      // drop it, and keep its errors from being uncaught.
-      const s = net.createServer(c => c.on('error', () => {}).destroy())
-      s.listen(0, '127.0.0.1')
-      await once(s, 'listening')
-      const p = (s.address() as net.AddressInfo).port
-      if (p < lo || p > hi) {
-        server = s
-        target = `127.0.0.1:${p}`
-        break
+  const servers: net.Server[] = []
+  try {
+    const targets: string[] = []
+    if (opts.target) {
+      targets.push(opts.target)
+    } else {
+      const range = opts.proxyPortRange ?? DEFAULT_WINDOWS_PROXY_PORT_RANGE
+      for (const host of ['127.0.0.1', '::1'] as const) {
+        const { server, target } = await bindWfpProbeListener(host, range)
+        servers.push(server)
+        targets.push(target)
       }
-      s.close()
     }
-    if (!target) {
-      throw new WindowsSandboxError(
-        'wfp_verify_bind_failed',
-        `verifyWindowsWfpEgress: could not bind a loopback ` +
-          `listener outside the WFP permit range [${lo},${hi}] in ` +
-          `5 attempts`,
-      )
+    // One family at a time: the first that fails rejects.
+    const results: WindowsWfpVerifyResult[] = []
+    for (const target of targets) results.push(await runWfpVerify(target, opts))
+    const [v4, v6] = results
+    if (!v6) return v4
+    return {
+      ...v4,
+      residuals: [...new Set([...v4.residuals, ...v6.residuals])],
+      warnings: [...new Set([...v4.warnings, ...v6.warnings])],
+      ipv6: {
+        target: v6.target,
+        stderr: v6.stderr,
+        probes: v6.probes,
+        residuals: v6.residuals,
+      },
     }
+  } finally {
+    for (const s of servers) s.close()
   }
+}
+
+/** One `srt-win wfp verify` run against `target`, interpreted. */
+async function runWfpVerify(
+  target: string,
+  opts: WfpVerifyOptions,
+): Promise<WindowsWfpVerifyResult> {
   const args = ['wfp', 'verify', '--target', target]
   if (opts.anonymousEgress) args.push('--anonymous-egress')
   if (opts.allowLoopback) args.push('--allow-loopback')
   // Under the token a command of the session gets.
   args.push('--write-restricted-token')
   for (const r of opts.writeRoots ?? []) args.push('--write-root', r)
-  try {
-    // 30s: first call after install may create the sandbox user's
-    // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW, and
-    // the runner bounds each of its connects (probe.rs).
-    const r = await runSrtWinAsync(args, {
-      timeoutMs: 30_000,
-      srtWin: opts.srtWin,
-    })
-    logForDebugging(
-      `[Sandbox Windows] wfp verify exit=${r.status}: ${r.stderr || r.stdout}`,
-    )
-    // Exit 18 comes with empty stdout: report the typed failure before
-    // the output is parsed.
-    const seclogon = seclogonDisabledFrom(r, 'wfp')
-    if (seclogon) throw seclogon
-    const result = interpretWindowsWfpVerify(r, {
-      sublayerGuid: opts.sublayerGuid,
-      proxyPortRange: opts.proxyPortRange,
-      sandboxUser: opts.sandboxUser,
-      allowLoopback: opts.allowLoopback,
-    })
-    for (const w of result.warnings) {
-      logForDebugging(`[Sandbox Windows] ${w}`, { level: 'warn' })
-    }
-    return result
-  } finally {
-    server?.close()
+  // 30s: first call after install may create the sandbox user's
+  // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW, and
+  // the runner bounds each of its connects (probe.rs).
+  const r = await runSrtWinAsync(args, {
+    timeoutMs: 30_000,
+    srtWin: opts.srtWin,
+  })
+  logForDebugging(
+    `[Sandbox Windows] wfp verify exit=${r.status}: ${r.stderr || r.stdout}`,
+  )
+  // Exit 18 comes with empty stdout: report the typed failure before
+  // the output is parsed.
+  const seclogon = seclogonDisabledFrom(r, 'wfp')
+  if (seclogon) throw seclogon
+  const result = interpretWindowsWfpVerify(r, {
+    sublayerGuid: opts.sublayerGuid,
+    proxyPortRange: opts.proxyPortRange,
+    sandboxUser: opts.sandboxUser,
+    allowLoopback: opts.allowLoopback,
+  })
+  for (const w of result.warnings) {
+    logForDebugging(`[Sandbox Windows] ${w}`, { level: 'warn' })
   }
+  return result
 }
 
 /**

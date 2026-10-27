@@ -1202,10 +1202,13 @@ enum WfpCmd {
     /// With `--allow-loopback` one loopback port stays blocked for
     /// the sandbox account (`wfp::LOOPBACK_PROBE_PORT`), and nothing
     /// listens on it. `egress_probe` and the lowered-integrity
-    /// loopback probes go there (`egress_target`) and pass only on
-    /// the filter's refusal: for `egress_probe`, a refusal by the
-    /// stack, a connect or no answer in time all mean the block did
-    /// not fire (exit 3). `anonymous_loopback_probe` and
+    /// loopback probes go there (`egress_target`), in `target`'s
+    /// address family: `127.0.0.1` for an IPv4 `target`, `[::1]` for
+    /// an IPv6 one. A run checks the block filter of that family
+    /// only; covering both takes one verify per family. They pass
+    /// only on the filter's refusal: for `egress_probe`, a refusal by
+    /// the stack, a connect or no answer in time all mean the block
+    /// did not fire (exit 3). `anonymous_loopback_probe` and
     /// `deny_only_probe` are `skipped`.
     ///
     /// Every probe but `egress_probe` and `open_loopback_probe`
@@ -1250,7 +1253,8 @@ enum WfpCmd {
         /// case is deterministic without depending on any external
         /// host. With `--allow-loopback` it is the listener
         /// `open_loopback_probe` must reach, and must be a loopback
-        /// address (exit 1 otherwise).
+        /// address (exit 1 otherwise); its family is the one the
+        /// blocked attempts go to.
         #[arg(long)]
         target: String,
         /// This session expects loopback open. Compared with the
@@ -1784,16 +1788,22 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 },
         } => {
             use srt_win::{install, logon, probe, runner};
-            // With loopback open, `target` is the listener that must be reachable.
-            if allow_loopback
-                && !target
-                    .parse::<std::net::SocketAddr>()
-                    .is_ok_and(|a| a.ip().is_loopback())
-            {
-                return Err(anyhow!(
-                    "wfp verify: with --allow-loopback, --target must be a                      loopback listener (`127.0.0.1:<port>`), got '{target}'"
-                ));
-            }
+            // With loopback open, `target` is the listener that must be
+            // reachable, and the blocked attempts go to the reserved port
+            // in its family.
+            let blocked_loopback = match target.parse::<std::net::SocketAddr>() {
+                Ok(a) if allow_loopback && a.ip().is_loopback() => {
+                    Some(probe::blocked_loopback_target(&a))
+                }
+                _ if allow_loopback => {
+                    return Err(anyhow!(
+                        "wfp verify: with --allow-loopback, --target must be a \
+                         loopback listener (`127.0.0.1:<port>` or `[::1]:<port>`), \
+                         got '{target}'"
+                    ));
+                }
+                _ => None,
+            };
             // The host passes a loopback listener outside the permit range, so
             // a MISSING fence connects where an active one gives WSAEACCES.
             let r = install::read_cred().and_then(|c| {
@@ -1835,10 +1845,9 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 probe::off_loopback_target(port).map(|a| a.to_string())
             });
             // Where the plain attempt goes: the reserved port when loopback is open.
-            let egress_target = if allow_loopback {
-                probe::blocked_loopback_target().to_string()
-            } else {
-                target.clone()
+            let egress_target = match blocked_loopback {
+                Some(a) => a.to_string(),
+                None => target.clone(),
             };
             // Write-restricted: the runner launches `probe egress` as a
             // lockdown child, so the connects are made under the child token.
