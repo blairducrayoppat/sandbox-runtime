@@ -240,7 +240,8 @@ function windowsSrtWinIdentity(srtWin: SrtWinSpawn): string {
 const WINDOWS_CAPABILITIES_WHY =
   `a session depends on (its read ` +
   `denies are written on the profile read grant's paths by srt-win, ` +
-  `and kept grants are checked and removed there)`
+  `kept grants are checked and removed there, and the network fence ` +
+  `is checked for each loopback address family)`
 
 /**
  * Make sure the `srt-win` this command runs through has reported every

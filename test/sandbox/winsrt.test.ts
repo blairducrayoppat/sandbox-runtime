@@ -78,6 +78,7 @@ import {
   WINDOWS_ALLOW_LOOPBACK_EFFECT,
   WINDOWS_LOOPBACK_NO_PROXY,
   WINDOWS_LOOPBACK_PROBE_PORT,
+  WINDOWS_SRT_WIN_CAPABILITIES,
   type WindowsWfpVerifyResult,
   type WindowsAclGrantOptions,
   type WindowsAclStampOptions,
@@ -228,6 +229,7 @@ const SRT_WIN_CAPABILITIES = [
   'kept-grant-holders',
   'read-deny-except',
   'exec-holder',
+  'wfp-verify-per-family',
 ]
 const CURRENT_PROFILE_GRANT = JSON.stringify({
   record_version: 1,
@@ -3311,7 +3313,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     }
   })
 
-  it('verifyWindowsWfpEgress: each loopback family gets its own run; both blocked resolves with both targets and the residuals of both', async () => {
+  it('verifyWindowsWfpEgress: each loopback family gets its own run; both blocked resolves with both targets, the residuals of both, and a warning of one run named for its listener', async () => {
     const servers = fakeServers([], [49999, 49998])
     try {
       stubSpawn(argv =>
@@ -3320,24 +3322,62 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
               status: 0,
               stdout: verifyOut({
                 target: targetOf(argv),
+                anonymous_loopback_probe: 'connected',
                 deny_only_probe: 'connected',
-                residuals: ['deny-only-user-sid'],
+                residuals: ['anonymous-loopback', 'deny-only-user-sid'],
               }),
             }
-          : { status: 0, stdout: verifyOut({ target: targetOf(argv) }) },
+          : {
+              status: 0,
+              stdout: verifyOut({
+                target: targetOf(argv),
+                anonymous_loopback_probe: 'connected',
+                residuals: ['anonymous-loopback'],
+              }),
+            },
       )
       const r = await verifyWindowsWfpEgress({
         srtWin: resolveSrtWin({ path: process.execPath }),
       })
       expect(targetsRun()).toEqual(['127.0.0.1:49999', '[::1]:49998'])
+      // The IPv4 run's, as with one run.
       expect(r.target).toBe('127.0.0.1:49999')
       expect(r.probes.plain).toBe('blocked')
+      expect(r.probes.denyOnly).toBe('blocked')
       expect(r.ipv6?.target).toBe('[::1]:49998')
       expect(r.ipv6?.probes.plain).toBe('blocked')
-      expect(r.ipv6?.residuals).toEqual(['deny-only-user-sid'])
-      expect(r.residuals).toEqual(['deny-only-user-sid'])
-      expect(r.warnings.length).toBe(1)
+      expect(r.ipv6?.residuals).toEqual([
+        'anonymous-loopback',
+        'deny-only-user-sid',
+      ])
+      expect(r.residuals).toEqual(['anonymous-loopback', 'deny-only-user-sid'])
+      // Raised by both runs: once, as is. By one: named for its listener.
+      expect(r.warnings.length).toBe(2)
+      expect(r.warnings[0]).toMatch(/^WFP egress fence residual 'anonymous-/)
+      expect(r.warnings[1]).toMatch(
+        /^\[::1\] WFP egress fence residual 'deny-only-user-sid'/,
+      )
       expect(servers.closed).toEqual([49999, 49998])
+    } finally {
+      servers.spy.mockRestore()
+    }
+  })
+
+  it('verifyWindowsWfpEgress: the anonymous off-loopback attempt is made in the first run only', async () => {
+    const servers = fakeServers([], [49999, 49998])
+    try {
+      stubSpawn(argv => ({
+        status: 0,
+        stdout: verifyOut({ target: targetOf(argv) }),
+      }))
+      await verifyWindowsWfpEgress({
+        anonymousEgress: true,
+        srtWin: resolveSrtWin({ path: process.execPath }),
+      })
+      const argvs = spawnSpy.mock.calls.map((c: unknown[]) => c[1] as string[])
+      expect(argvs.map(targetOf)).toEqual(['127.0.0.1:49999', '[::1]:49998'])
+      expect(argvs[0]).toContain('--anonymous-egress')
+      expect(argvs[1]).not.toContain('--anonymous-egress')
     } finally {
       servers.spy.mockRestore()
     }
@@ -3417,7 +3457,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     }
   })
 
-  it('verifyWindowsWfpEgress: with loopback open the IPv6 run must be aimed at [::1] on the reserved port; an srt-win that aims it at 127.0.0.1 rejects as too old', async () => {
+  it('verifyWindowsWfpEgress: with loopback open the IPv6 run must be aimed at [::1] on the reserved port; an srt-win that aims it at 127.0.0.1 lacks wfp-verify-per-family (srt_win_outdated)', async () => {
     const reservedV6 = `[::1]:${WINDOWS_LOOPBACK_PROBE_PORT}`
     const run = async (v6EgressTarget: string) => {
       const servers = fakeServers([], [49999, 49998])
@@ -3452,9 +3492,12 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     const err = await run(`127.0.0.1:${WINDOWS_LOOPBACK_PROBE_PORT}`).catch(
       e => e as WindowsSandboxError,
     )
-    expect((err as WindowsSandboxError).code).toBe('srt_win_too_old')
+    expect((err as WindowsSandboxError).code).toBe('srt_win_outdated')
+    expect((err as WindowsSandboxError).message).toContain(
+      `'${WINDOWS_SRT_WIN_CAPABILITIES.wfpVerifyPerFamily}'`,
+    )
     expect((err as WindowsSandboxError).message).toMatch(
-      /listener \[::1\]:49998 at 127\.0\.0\.1:1/,
+      /listener \[::1\]:49998, aimed the attempts that must be blocked at 127\.0\.0\.1:1/,
     )
   })
 
@@ -7938,6 +7981,11 @@ describe('Windows profile read grant (pure, all platforms)', () => {
             'lacks its own exclusion check',
             ['profile-deny-expansion', 'kept-grant-holders'],
             'profile-session-grant-check',
+          ],
+          [
+            'checks the fence of one loopback family only',
+            SRT_WIN_CAPABILITIES.filter(c => c !== 'wfp-verify-per-family'),
+            'wfp-verify-per-family',
           ],
         ] as const) {
           it(`${state} and srt-win ${what}: srt_win_outdated, nothing granted`, async () => {

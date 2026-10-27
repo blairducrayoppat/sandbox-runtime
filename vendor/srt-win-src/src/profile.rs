@@ -1084,6 +1084,7 @@ pub const CAPABILITIES: &[&str] = &[
     "kept-grant-holders",
     "read-deny-except",
     "exec-holder",
+    "wfp-verify-per-family",
 ];
 
 /// The recorded paths that carry an allow of their own, for working
